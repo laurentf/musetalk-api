@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import structlog
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
 # Add MuseTalk to path
@@ -91,10 +91,10 @@ async def _load_models() -> None:
 async def generate_video(
     audio: UploadFile = File(..., description="WAV or MP3 audio file"),
     image: UploadFile = File(..., description="Face image (JPEG/PNG)"),
-    bbox_shift: int = _BBOX_SHIFT,
-    fps: int = 25,
-    extra_margin: int = 10,
-    parsing_mode: str = "jaw",
+    bbox_shift: int = Form(_BBOX_SHIFT),
+    fps: int = Form(15),
+    extra_margin: int = Form(10),
+    parsing_mode: str = Form("raw"),
 ) -> FileResponse:
     """Generate a lip-sync video from audio + face image."""
     if not _models_ready:
