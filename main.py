@@ -235,18 +235,22 @@ def _run_pipeline(
         for frame in recon:
             res_frame_list.append(frame)
 
-    # 6. Blend results back into original frames
-    img_save_dir = os.path.join(work_dir, "frames")
-    os.makedirs(img_save_dir, exist_ok=True)
-
-    # Extend coord/frame lists to match generated frames count
+    # 6. Blend results and write video directly (skip intermediate PNGs)
     n = len(res_frame_list)
     coords_extended = (coord_list_cycle * (n // len(coord_list_cycle) + 1))[:n]
     frames_extended = (frame_list_cycle * (n // len(frame_list_cycle) + 1))[:n]
 
-    for i, (res_frame, bbox, ori_frame) in enumerate(
-        zip(res_frame_list, coords_extended, frames_extended)
-    ):
+    first_frame = frames_extended[0]
+    h, w = first_frame.shape[:2]
+
+    temp_vid = os.path.join(work_dir, "temp.mp4")
+    output_vid = os.path.join(work_dir, "output.mp4")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(temp_vid, fourcc, fps, (w, h))
+
+    frame_count = 0
+    for res_frame, bbox, ori_frame in zip(res_frame_list, coords_extended, frames_extended):
         if bbox == coord_placeholder:
             continue
         x1, y1, x2, y2 = bbox
@@ -256,35 +260,21 @@ def _run_pipeline(
             mode=parsing_mode,
             fp=_face_parsing,
         )
-        cv2.imwrite(os.path.join(img_save_dir, f"{i:08d}.png"), combine)
+        writer.write(combine)
+        frame_count += 1
 
-    # 7. Assemble video with ffmpeg
-    temp_vid = os.path.join(work_dir, "temp.mp4")
-    output_vid = os.path.join(work_dir, "output.mp4")
+    writer.release()
+    logger.info("musetalk.frames_written", count=frame_count)
 
-    # Count frames written
-    frame_count = len([f for f in os.listdir(img_save_dir) if f.endswith(".png")])
-    logger.info("musetalk.frames_written", count=frame_count, dir=img_save_dir)
-
-    r1 = subprocess.run([
-        "ffmpeg", "-y", "-v", "error",
-        "-r", str(fps), "-f", "image2",
-        "-i", os.path.join(img_save_dir, "%08d.png"),
-        "-vcodec", "mpeg4", "-q:v", "5",
-        temp_vid,
-    ], capture_output=True, text=True)
-    if r1.returncode != 0:
-        logger.error("musetalk.ffmpeg_img2vid_failed", stderr=r1.stderr)
-        raise RuntimeError(f"ffmpeg img2vid failed: {r1.stderr}")
-
-    r2 = subprocess.run([
+    # Merge audio
+    r = subprocess.run([
         "ffmpeg", "-y", "-v", "error",
         "-i", audio_path, "-i", temp_vid,
         "-c:v", "copy", "-c:a", "aac", "-shortest",
         output_vid,
     ], capture_output=True, text=True)
-    if r2.returncode != 0:
-        logger.error("musetalk.ffmpeg_merge_failed", stderr=r2.stderr)
-        raise RuntimeError(f"ffmpeg merge failed: {r2.stderr}")
+    if r.returncode != 0:
+        logger.error("musetalk.ffmpeg_merge_failed", stderr=r.stderr)
+        raise RuntimeError(f"ffmpeg merge failed: {r.stderr}")
 
     return output_vid
