@@ -1,0 +1,17 @@
+services:
+  musetalk:
+    build: .
+    container_name: musetalk
+    ports:
+      - "8008:8000"
+    volumes:
+      - ./models:/app/MuseTalk/models
+      - ./results:/app/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
