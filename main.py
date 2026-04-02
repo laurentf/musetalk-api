@@ -1,11 +1,12 @@
 """MuseTalk API — generate lip-sync video from audio + face image.
 
 Accepts WAV/MP3 audio and a face image via multipart upload,
-returns an MP4 video with synchronized lip movements.
+returns an MP4 video with synchronized lip movements (v1.5).
 """
 
 import os
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from time import time
@@ -20,7 +21,36 @@ _RESULT_DIR = os.getenv("RESULT_DIR", "/app/results")
 _MUSETALK_DIR = "/app/MuseTalk"
 _BBOX_SHIFT = int(os.getenv("BBOX_SHIFT", "0"))
 
+# Add MuseTalk to Python path so we can import its modules
+sys.path.insert(0, _MUSETALK_DIR)
+
 app = FastAPI(title="MuseTalk API", version="0.1.0")
+
+# ---------------------------------------------------------------------------
+# Model preloading at startup
+# ---------------------------------------------------------------------------
+
+_models_ready = False
+
+
+@app.on_event("startup")
+async def _load_models() -> None:
+    """Preload MuseTalk models into GPU at startup."""
+    global _models_ready
+    try:
+        logger.info("musetalk.loading_models")
+        from musetalk.utils.utils import load_all_model
+
+        load_all_model()
+        _models_ready = True
+        logger.info("musetalk.models_ready")
+    except Exception:
+        logger.exception("musetalk.model_load_failed")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.post("/generate")
@@ -28,11 +58,30 @@ async def generate_video(
     audio: UploadFile = File(..., description="WAV or MP3 audio file"),
     image: UploadFile = File(..., description="Face image (JPEG/PNG)"),
     bbox_shift: int = _BBOX_SHIFT,
+    fps: int = 25,
+    use_float16: bool = True,
+    extra_margin: int = 10,
+    parsing_mode: str = "jaw",
 ) -> FileResponse:
     """Generate a lip-sync video from audio + face image.
 
+    Args:
+        audio: WAV or MP3 audio file.
+        image: Face image (JPEG/PNG).
+        bbox_shift: Mouth openness (positive = more open, negative = less).
+        fps: Output video FPS (default 25).
+        use_float16: Use FP16 for faster inference and lower VRAM.
+        extra_margin: Extra margin around face crop (pixels).
+        parsing_mode: Face blending mode ("jaw" or "lip").
+
     Returns the MP4 video file directly.
     """
+    if not _models_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Models not loaded yet",
+        )
+
     job_id = str(uuid.uuid4())[:8]
     work_dir = Path(_RESULT_DIR) / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -55,23 +104,30 @@ async def generate_video(
 
     # Write inference config YAML
     config_path = work_dir / "config.yaml"
-    output_vid = work_dir / "output.mp4"
     config_path.write_text(
-        f"video_path: {image_path}\n"
-        f"audio_path: {audio_path}\n"
-        f"bbox_shift: {bbox_shift}\n"
-        f"result_dir: {work_dir}\n"
+        f"task_0:\n"
+        f"  video_path: {image_path}\n"
+        f"  audio_path: {audio_path}\n"
+        f"  bbox_shift: {bbox_shift}\n"
     )
 
     try:
         t0 = time()
 
+        cmd = [
+            sys.executable, "-m", "scripts.inference",
+            "--inference_config", str(config_path),
+            "--result_dir", str(work_dir),
+            "--fps", str(fps),
+            "--extra_margin", str(extra_margin),
+            "--parsing_mode", parsing_mode,
+            "--version", "v15",
+        ]
+        if use_float16:
+            cmd.append("--use_float16")
+
         result = subprocess.run(
-            [
-                "python", "-m", "scripts.inference",
-                "--inference_config", str(config_path),
-                "--bbox_shift", str(bbox_shift),
-            ],
+            cmd,
             cwd=_MUSETALK_DIR,
             capture_output=True,
             text=True,
@@ -83,13 +139,14 @@ async def generate_video(
                 "musetalk.inference_failed",
                 job_id=job_id,
                 stderr=result.stderr[-500:] if result.stderr else "",
+                stdout=result.stdout[-500:] if result.stdout else "",
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=result.stderr[-500:] if result.stderr else "Inference failed",
             )
 
-        # Find the output video (MuseTalk names it based on input)
+        # Find the output video
         video_path = _find_output_video(work_dir)
         if not video_path:
             raise HTTPException(
@@ -131,14 +188,18 @@ async def generate_video(
 
 @app.get("/health")
 async def health_check() -> dict[str, str]:
+    if not _models_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Models loading",
+        )
     return {"status": "ok"}
 
 
 def _find_output_video(work_dir: Path) -> Path | None:
     """Find the generated video in the work directory."""
-    # MuseTalk outputs to result_dir with various naming patterns
     for pattern in ["*.mp4", "**/*.mp4"]:
         for f in work_dir.glob(pattern):
-            if f.stat().st_size > 1000:  # Skip tiny/empty files
+            if f.stat().st_size > 1000:
                 return f
     return None
