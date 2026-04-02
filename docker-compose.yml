@@ -6,7 +6,7 @@ services:
       - "8008:8000"
     volumes:
       - ./models:/app/MuseTalk/models
-      - ./results:/app/results
+      - ./results:/app/MuseTalk/results
     deploy:
       resources:
         reservations:

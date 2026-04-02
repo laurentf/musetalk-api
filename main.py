@@ -2,6 +2,8 @@
 
 Accepts WAV/MP3 audio and a face image via multipart upload,
 returns an MP4 video with synchronized lip movements (v1.5).
+
+Models are loaded once at startup and reused across requests.
 """
 
 import os
@@ -11,39 +13,71 @@ import uuid
 from pathlib import Path
 from time import time
 
+import cv2
+import numpy as np
 import structlog
+import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
-logger = structlog.get_logger(__name__)
-
-_RESULT_DIR = os.getenv("RESULT_DIR", "/app/results")
+# Add MuseTalk to path
 _MUSETALK_DIR = "/app/MuseTalk"
-_BBOX_SHIFT = int(os.getenv("BBOX_SHIFT", "0"))
-
-# Add MuseTalk to Python path so we can import its modules
 sys.path.insert(0, _MUSETALK_DIR)
 
-app = FastAPI(title="MuseTalk API", version="0.1.0")
+from musetalk.utils.utils import load_all_model
+from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
+from musetalk.utils.blending import get_image
+from musetalk.utils.utils import datagen
+
+logger = structlog.get_logger(__name__)
+
+_RESULT_DIR = os.getenv("RESULT_DIR", os.path.join(_MUSETALK_DIR, "results"))
+_BBOX_SHIFT = int(os.getenv("BBOX_SHIFT", "0"))
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+app = FastAPI(title="MuseTalk API", version="0.2.0")
 
 # ---------------------------------------------------------------------------
-# Model preloading at startup
+# Global model references (loaded once at startup)
 # ---------------------------------------------------------------------------
 
+_vae = None
+_unet = None
+_pe = None
+_timesteps = None
+_audio_processor = None
+_face_parsing = None
 _models_ready = False
 
 
 @app.on_event("startup")
 async def _load_models() -> None:
-    """Preload MuseTalk models into GPU at startup."""
-    global _models_ready
+    """Preload all MuseTalk models into GPU at startup."""
+    global _vae, _unet, _pe, _timesteps, _audio_processor, _face_parsing, _models_ready
     try:
         logger.info("musetalk.loading_models")
-        from musetalk.utils.utils import load_all_model
 
-        load_all_model()
+        _vae, _unet, _pe = load_all_model(device=_DEVICE)
+
+        # Convert to float16 for faster inference + lower VRAM
+        if _DEVICE.type == "cuda":
+            _pe = _pe.half()
+            _vae.vae = _vae.vae.half()
+            _unet.model = _unet.model.half()
+
+        _timesteps = torch.tensor([0], device=_DEVICE)
+
+        from musetalk.whisper.audio2feature import Audio2Feature
+        _audio_processor = Audio2Feature(
+            model_path=os.path.join("models", "whisper", "tiny.pt"),
+        )
+
+        from musetalk.utils.face_parsing import FaceParsing
+        _face_parsing = FaceParsing()
+
         _models_ready = True
         logger.info("musetalk.models_ready")
+
     except Exception:
         logger.exception("musetalk.model_load_failed")
 
@@ -59,23 +93,10 @@ async def generate_video(
     image: UploadFile = File(..., description="Face image (JPEG/PNG)"),
     bbox_shift: int = _BBOX_SHIFT,
     fps: int = 25,
-    use_float16: bool = True,
     extra_margin: int = 10,
     parsing_mode: str = "jaw",
 ) -> FileResponse:
-    """Generate a lip-sync video from audio + face image.
-
-    Args:
-        audio: WAV or MP3 audio file.
-        image: Face image (JPEG/PNG).
-        bbox_shift: Mouth openness (positive = more open, negative = less).
-        fps: Output video FPS (default 25).
-        use_float16: Use FP16 for faster inference and lower VRAM.
-        extra_margin: Extra margin around face crop (pixels).
-        parsing_mode: Face blending mode ("jaw" or "lip").
-
-    Returns the MP4 video file directly.
-    """
+    """Generate a lip-sync video from audio + face image."""
     if not _models_ready:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -86,7 +107,6 @@ async def generate_video(
     work_dir = Path(_RESULT_DIR) / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write uploaded files to disk
     audio_ext = Path(audio.filename or "input.wav").suffix or ".wav"
     image_ext = Path(image.filename or "input.jpg").suffix or ".jpg"
     audio_path = work_dir / f"input{audio_ext}"
@@ -102,81 +122,31 @@ async def generate_video(
         image_size=image_path.stat().st_size,
     )
 
-    # Write inference config YAML
-    config_path = work_dir / "config.yaml"
-    config_path.write_text(
-        f"task_0:\n"
-        f"  video_path: {image_path}\n"
-        f"  audio_path: {audio_path}\n"
-        f"  bbox_shift: {bbox_shift}\n"
-    )
-
     try:
         t0 = time()
-
-        cmd = [
-            sys.executable, "-m", "scripts.inference",
-            "--inference_config", str(config_path),
-            "--result_dir", str(work_dir),
-            "--fps", str(fps),
-            "--extra_margin", str(extra_margin),
-            "--parsing_mode", parsing_mode,
-            "--version", "v15",
-        ]
-        if use_float16:
-            cmd.append("--use_float16")
-
-        result = subprocess.run(
-            cmd,
-            cwd=_MUSETALK_DIR,
-            capture_output=True,
-            text=True,
-            timeout=180,
+        output_path = _run_pipeline(
+            str(image_path),
+            str(audio_path),
+            str(work_dir),
+            bbox_shift=bbox_shift,
+            fps=fps,
+            extra_margin=extra_margin,
+            parsing_mode=parsing_mode,
         )
-
-        if result.returncode != 0:
-            logger.error(
-                "musetalk.inference_failed",
-                job_id=job_id,
-                stderr=result.stderr[-500:] if result.stderr else "",
-                stdout=result.stdout[-500:] if result.stdout else "",
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.stderr[-500:] if result.stderr else "Inference failed",
-            )
-
-        # Find the output video
-        video_path = _find_output_video(work_dir)
-        if not video_path:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="No output video found",
-            )
-
         elapsed = round(time() - t0, 1)
+
         logger.info(
             "musetalk.generate_done",
             job_id=job_id,
             elapsed_sec=elapsed,
-            video_path=str(video_path),
+            video_path=output_path,
         )
 
         return FileResponse(
-            str(video_path),
+            output_path,
             media_type="video/mp4",
             filename=f"{job_id}.mp4",
         )
-
-    except subprocess.TimeoutExpired:
-        logger.error("musetalk.timeout", job_id=job_id)
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Inference timed out",
-        )
-
-    except HTTPException:
-        raise
 
     except Exception as exc:
         logger.exception("musetalk.generate_error", job_id=job_id)
@@ -196,10 +166,125 @@ async def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _find_output_video(work_dir: Path) -> Path | None:
-    """Find the generated video in the work directory."""
-    for pattern in ["*.mp4", "**/*.mp4"]:
-        for f in work_dir.glob(pattern):
-            if f.stat().st_size > 1000:
-                return f
-    return None
+# ---------------------------------------------------------------------------
+# Pipeline (runs in-process, reuses preloaded models)
+# ---------------------------------------------------------------------------
+
+
+def _run_pipeline(
+    image_path: str,
+    audio_path: str,
+    work_dir: str,
+    *,
+    bbox_shift: int = 0,
+    fps: int = 25,
+    extra_margin: int = 10,
+    parsing_mode: str = "jaw",
+    batch_size: int = 8,
+) -> str:
+    """Run MuseTalk inference. Returns path to output MP4."""
+    # 1. Detect face landmarks and bounding box
+    # get_landmark_and_bbox expects a list of image file paths
+    coord_list, frame_list = get_landmark_and_bbox([image_path], bbox_shift)
+
+    # 2. Encode frames to latents
+    input_latent_list = []
+    for bbox, frame in zip(coord_list, frame_list):
+        if bbox == coord_placeholder:
+            continue
+        x1, y1, x2, y2 = bbox
+        crop = cv2.resize(frame[y1:y2, x1:x2], (256, 256))
+        latents = _vae.get_latents_for_unet(crop)
+        input_latent_list.append(latents)
+
+    if not input_latent_list:
+        raise ValueError("No face detected in image")
+
+    # 3. Extract audio features
+    whisper_feature = _audio_processor.audio2feat(audio_path)
+    whisper_chunks = _audio_processor.feature2chunks(
+        whisper_feature,
+        fps=fps,
+    )
+
+    # 4. Cycle frames for multi-frame sources
+    frame_list_cycle = frame_list + frame_list[::-1]
+    coord_list_cycle = coord_list + coord_list[::-1]
+    input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+
+    # 5. Batch inference
+    # Convert whisper chunks from numpy to tensors
+    whisper_chunks_tensor = [torch.from_numpy(c).to(device=_DEVICE, dtype=torch.float16) if isinstance(c, np.ndarray) else c for c in whisper_chunks]
+
+    gen = datagen(
+        whisper_chunks=whisper_chunks_tensor,
+        vae_encode_latents=input_latent_list_cycle,
+        batch_size=batch_size,
+        delay_frame=0,
+    )
+
+    res_frame_list = []
+    for whisper_batch, latent_batch in gen:
+        whisper_batch = whisper_batch.to(device=_DEVICE, dtype=torch.float16)
+        latent_batch = latent_batch.to(device=_DEVICE, dtype=torch.float16)
+        audio_feat = _pe(whisper_batch)
+        pred = _unet.model(
+            latent_batch, _timesteps, encoder_hidden_states=audio_feat,
+        ).sample
+        recon = _vae.decode_latents(pred)
+        for frame in recon:
+            res_frame_list.append(frame)
+
+    # 6. Blend results back into original frames
+    img_save_dir = os.path.join(work_dir, "frames")
+    os.makedirs(img_save_dir, exist_ok=True)
+
+    # Extend coord/frame lists to match generated frames count
+    n = len(res_frame_list)
+    coords_extended = (coord_list_cycle * (n // len(coord_list_cycle) + 1))[:n]
+    frames_extended = (frame_list_cycle * (n // len(frame_list_cycle) + 1))[:n]
+
+    for i, (res_frame, bbox, ori_frame) in enumerate(
+        zip(res_frame_list, coords_extended, frames_extended)
+    ):
+        if bbox == coord_placeholder:
+            continue
+        x1, y1, x2, y2 = bbox
+        res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+        combine = get_image(
+            ori_frame, res_frame, bbox,
+            mode=parsing_mode,
+            fp=_face_parsing,
+        )
+        cv2.imwrite(os.path.join(img_save_dir, f"{i:08d}.png"), combine)
+
+    # 7. Assemble video with ffmpeg
+    temp_vid = os.path.join(work_dir, "temp.mp4")
+    output_vid = os.path.join(work_dir, "output.mp4")
+
+    # Count frames written
+    frame_count = len([f for f in os.listdir(img_save_dir) if f.endswith(".png")])
+    logger.info("musetalk.frames_written", count=frame_count, dir=img_save_dir)
+
+    r1 = subprocess.run([
+        "ffmpeg", "-y", "-v", "error",
+        "-r", str(fps), "-f", "image2",
+        "-i", os.path.join(img_save_dir, "%08d.png"),
+        "-vcodec", "mpeg4", "-q:v", "5",
+        temp_vid,
+    ], capture_output=True, text=True)
+    if r1.returncode != 0:
+        logger.error("musetalk.ffmpeg_img2vid_failed", stderr=r1.stderr)
+        raise RuntimeError(f"ffmpeg img2vid failed: {r1.stderr}")
+
+    r2 = subprocess.run([
+        "ffmpeg", "-y", "-v", "error",
+        "-i", audio_path, "-i", temp_vid,
+        "-c:v", "copy", "-c:a", "aac", "-shortest",
+        output_vid,
+    ], capture_output=True, text=True)
+    if r2.returncode != 0:
+        logger.error("musetalk.ffmpeg_merge_failed", stderr=r2.stderr)
+        raise RuntimeError(f"ffmpeg merge failed: {r2.stderr}")
+
+    return output_vid

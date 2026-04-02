@@ -19,7 +19,6 @@ WORKDIR /app/MuseTalk
 
 # Install MuseTalk dependencies
 RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir --editable ./musetalk/whisper && \
     pip install --no-cache-dir -U openmim && \
     mim install mmengine && \
     mim install "mmcv>=2.0.1" && \
@@ -35,7 +34,7 @@ RUN pip install --no-cache-dir \
 # Create results directory
 RUN mkdir -p /app/results
 
-WORKDIR /app
+WORKDIR /app/MuseTalk
 
 # Copy API server
 COPY main.py ./
